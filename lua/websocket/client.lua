@@ -101,7 +101,7 @@ function WebsocketClient:try_connect()
 
 
   -- Start polling for events (repeat indefinitely: -1)
-  self._poll_timer = vim.fn.timer_start(2000, function() 
+  self._poll_timer = vim.fn.timer_start(200, function() 
 
     if self:is_active() then
       websocket_client_ffi.poll_events()
