@@ -16,6 +16,7 @@ local M = {}
 ---@field on_client_disconnect fun(server: WebsocketServer, client_id: string)
 ---@field on_client_connect fun(server: WebsocketServer, client_id: string)
 ---@field on_error fun(server: WebsocketServer, err: WebsocketClientError)
+---@field _poll_timer number|nil
 local WebsocketServer = {}
 WebsocketServer.__index = WebsocketServer
 WebsocketServer.__is_class = true
@@ -52,6 +53,7 @@ function WebsocketServer.new(opts)
     on_client_disconnect = opts.on_client_disconnect,
     on_client_connect = opts.on_client_connect,
     on_error = opts.on_error,
+    _poll_timer = nil,
   }
   setmetatable(obj, WebsocketServer)
   WebsocketServerMap[server_id] = obj
@@ -98,6 +100,19 @@ function WebsocketServer:try_start()
     self.port,
     self.extra_response_headers
   )
+  
+  -- Start polling for events (repeat indefinitely: -1)
+  self._poll_timer = vim.fn.timer_start(200, function()
+    if self:is_active() then
+      websocket_server_ffi.poll_events(self.server_id)
+    else
+      -- Server stopped, stop polling
+      if self._poll_timer then
+        vim.fn.timer_stop(self._poll_timer)
+        self._poll_timer = nil
+      end
+    end
+  end, { ["repeat"] = -1 })
 end
 
 -- Check if the websocket server is active
@@ -135,6 +150,16 @@ end
 ---@param data string
 function WebsocketServer:try_broadcast_data_to_clients(data)
   websocket_server_ffi.broadcast_data(self.server_id, data)
+end
+
+-- Stop the websocket server
+function WebsocketServer:try_stop()
+  -- Stop polling timer before stopping server
+  if self._poll_timer then
+    vim.fn.timer_stop(self._poll_timer)
+    self._poll_timer = nil
+  end
+  websocket_server_ffi.terminate(self.server_id)
 end
 
 return M

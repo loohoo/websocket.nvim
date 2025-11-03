@@ -10,7 +10,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
 
-use log::info;
+use log::{error, info};
 
 mod client;
 mod ffi;
@@ -117,37 +117,47 @@ impl WebsocketServer {
         let clients = Arc::new(Mutex::new(HashMap::new()));
 
         let lua_handle = AsyncHandle::new(move || {
-            let event = inbound_event_receiver.blocking_recv().unwrap();
-            let callbacks_clone = callbacks.clone();
-            schedule(move |_| {
-                match event {
-                    WebsocketServerInboundEvent::ClientConnected(client_id) => {
-                        if let Some(on_connect) = callbacks_clone.on_client_connect {
-                            on_connect.call::<_, ()>((id.to_string(), client_id.to_string()))?;
+            // Use try_recv to avoid blocking in the async context
+            if let Ok(event) = inbound_event_receiver.try_recv() {
+                let callbacks_clone = callbacks.clone();
+                schedule(move |_| {
+                    match event {
+                        WebsocketServerInboundEvent::ClientConnected(client_id) => {
+                            if let Some(on_connect) = callbacks_clone.on_client_connect {
+                                if let Err(err) = on_connect.call::<_, ()>((id.to_string(), client_id.to_string())) {
+                                    error!("Error calling on_client_connect callback: {}", err);
+                                }
+                            }
+                        }
+                        WebsocketServerInboundEvent::ClientDisconnected(client_id) => {
+                            if let Some(on_disconnect) = callbacks_clone.on_client_disconnect {
+                                if let Err(err) = on_disconnect.call::<_, ()>((id.to_string(), client_id.to_string())) {
+                                    error!("Error calling on_client_disconnect callback: {}", err);
+                                }
+                            }
+                        }
+                        WebsocketServerInboundEvent::NewMessage(client_id, message) => {
+                            if let Some(on_message) = callbacks_clone.on_message {
+                                if let Err(err) = on_message.call::<_, ()>((
+                                    id.to_string(),
+                                    client_id.to_string(),
+                                    message,
+                                )) {
+                                    error!("Error calling on_message callback: {}", err);
+                                }
+                            }
+                        }
+                        WebsocketServerInboundEvent::Error(error) => {
+                            if let Some(on_error) = callbacks_clone.on_error {
+                                if let Err(err) = on_error.call::<_, ()>((id.to_string(), error)) {
+                                    error!("Error calling on_error callback: {}", err);
+                                }
+                            }
                         }
                     }
-                    WebsocketServerInboundEvent::ClientDisconnected(client_id) => {
-                        if let Some(on_disconnect) = callbacks_clone.on_client_disconnect {
-                            on_disconnect.call::<_, ()>((id.to_string(), client_id.to_string()))?;
-                        }
-                    }
-                    WebsocketServerInboundEvent::NewMessage(client_id, message) => {
-                        if let Some(on_message) = callbacks_clone.on_message {
-                            on_message.call::<_, ()>((
-                                id.to_string(),
-                                client_id.to_string(),
-                                message,
-                            ))?;
-                        }
-                    }
-                    WebsocketServerInboundEvent::Error(error) => {
-                        if let Some(on_error) = callbacks_clone.on_error {
-                            on_error.call::<_, ()>((id.to_string(), error))?;
-                        }
-                    }
-                }
-                Ok(())
-            });
+                    Ok(())
+                });
+            }
             Ok::<_, nvim_oxi::Error>(())
         })?;
 
@@ -192,7 +202,6 @@ impl WebsocketServer {
 
     fn send_event(&self, event: WebsocketServerInboundEvent) {
         self.inbound_event_publisher.send(event).unwrap();
-        self.lua_handle.send().unwrap();
     }
 
     fn terminate(&self) {

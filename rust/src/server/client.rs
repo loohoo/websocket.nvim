@@ -43,10 +43,8 @@ impl WebsocketServerClient {
             mpsc::unbounded_channel::<WebsocketServerCloseConnectionEvent>();
 
         let inbound_event_publisher_clone = inbound_event_publisher.clone();
-        let lua_handle_clone = lua_handle.clone();
         let send_event = move |event: WebsocketServerInboundEvent| {
             inbound_event_publisher_clone.send(event).unwrap();
-            lua_handle_clone.send().unwrap();
         };
 
         // https://github.com/snapview/tokio-tungstenite/blob/master/examples/server-headers.rs
@@ -170,7 +168,6 @@ impl WebsocketServerClient {
 
     fn send_event(&self, event: WebsocketServerInboundEvent) {
         self.inbound_event_publisher.send(event).unwrap();
-        self.lua_handle.send().unwrap();
     }
 
     pub(super) fn terminate(&mut self) {

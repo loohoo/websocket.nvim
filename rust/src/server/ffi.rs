@@ -36,6 +36,10 @@ pub fn websocket_server_ffi() -> Dictionary {
             "get_clients",
             Object::from(Function::from_fn(get_clients)),
         ),
+        (
+            "poll_events",
+            Object::from(Function::from_fn(poll_events)),
+        ),
     ])
 }
 
@@ -111,6 +115,15 @@ fn get_clients(server_id: String) -> nvim_oxi::Result<Dictionary> {
         .map(|(id, client)| (id.to_string().as_str().into(), client.lock().deref().into()))
         .collect();
     Ok(Dictionary::from_iter(clients))
+}
+
+fn poll_events(server_id: String) -> nvim_oxi::Result<()> {
+    let registry = WEBSOCKET_SERVER_REGISTRY.lock();
+    let server_id = Uuid::parse_str(&server_id).unwrap();
+    if let Some(server) = registry.get(&server_id) {
+        let _ = server.lua_handle.send();
+    }
+    Ok(())
 }
 
 

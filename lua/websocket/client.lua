@@ -15,6 +15,7 @@ local M = {}
 ---@field on_disconnect fun(self: WebsocketClient)
 ---@field on_connect fun(self: WebsocketClient)
 ---@field on_error fun(self: WebsocketClient, err: WebsocketClientError)
+---@field _poll_timer number|nil
 local WebsocketClient = {}
 WebsocketClient.__index = WebsocketClient
 WebsocketClient.__is_class = true
@@ -48,6 +49,7 @@ function WebsocketClient.new(opts)
     on_disconnect = opts.on_disconnect,
     on_connect = opts.on_connect,
     on_error = opts.on_error,
+    _poll_timer = nil,
   }
   setmetatable(obj, WebsocketClient)
   WebsocketClientMap[client_id] = obj
@@ -95,6 +97,17 @@ function WebsocketClient:try_connect()
     self.connect_addr,
     self.extra_headers
   )
+ 
+
+
+  -- Start polling for events (repeat indefinitely: -1)
+  self._poll_timer = vim.fn.timer_start(2000, function() 
+
+    if self:is_active() then
+      websocket_client_ffi.poll_events()
+    end
+  end, { ["repeat"] = -1 })
+ 
 end
 
 -- Check if the websocket client is active
@@ -121,6 +134,11 @@ end
 
 -- Disconnect from the websocket server
 function WebsocketClient:try_disconnect()
+  -- Stop polling timer before disconnecting
+  if self._poll_timer then
+    vim.fn.timer_stop(self._poll_timer)
+    self._poll_timer = nil
+  end
   websocket_client_ffi.disconnect(self.client_id)
 end
 

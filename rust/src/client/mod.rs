@@ -11,7 +11,8 @@ use url::Url;
 use uuid::Uuid;
 
 use log::{debug, error, info, warn};
-use tokio_tungstenite::tungstenite::{self};
+use tokio_tungstenite::tungstenite::{self, http::header::HeaderValue};
+use std::str::FromStr;
 
 mod ffi;
 mod inbound_event;
@@ -48,58 +49,37 @@ async fn start_client(
         inbound_event_publisher
             .send(event)
             .unwrap_or_else(|err| error!("Failed to send event: {}", err));
-        lua_handle
-            .send()
-            .unwrap_or_else(|err| error!("Failed to send event: {}", err));
     };
 
-    let default_port = match connect_addr.scheme() {
-        "ws" => 80,
-        "wss" => 443,
-        _ => 80,
+    info!("Connecting to WebSocket: {}", connect_addr.as_str());
+    
+    // Use the simpler connect_async with URL - handles WSS/TLS automatically
+    let (ws_stream, _response) = if extra_headers.is_empty() {
+        // Simple connection without custom headers
+        tokio_tungstenite::connect_async(connect_addr.as_str())
+            .await
+            .map_err(|err| WebsocketClientError::ConnectionError(err.to_string()))?
+    } else {
+        // Connection with custom headers
+        let mut request = tungstenite::http::Request::builder()
+            .uri(connect_addr.as_str())
+            .body(())
+            .map_err(|err| WebsocketClientError::ConnectionError(err.to_string()))?;
+
+        for (key, value) in extra_headers.clone() {
+            debug!("Adding header: {}={}", key, value);
+            let key_static_ref: &'static str = key.leak();
+            request.headers_mut().insert(
+                key_static_ref,
+                HeaderValue::from_str(&value)
+                    .map_err(|err| WebsocketClientError::ConnectionError(err.to_string()))?,
+            );
+        }
+
+        tokio_tungstenite::connect_async(request)
+            .await
+            .map_err(|err| WebsocketClientError::ConnectionError(err.to_string()))?
     };
-    let mut request = tungstenite::http::Request::builder()
-        .header(
-            "Host",
-            format!(
-                "{}:{}",
-                connect_addr
-                    .host_str()
-                    .ok_or(WebsocketClientError::ConnectionError(
-                        "Host is not set".to_string()
-                    ))?,
-                connect_addr.port().unwrap_or_else(|| {
-                    info!("Port is not set. Using default port: {}", default_port);
-                    default_port
-                })
-            ),
-        )
-        .header(
-            "Sec-WebSocket-Key",
-            tungstenite::handshake::client::generate_key(),
-        )
-        .header("Upgrade", "Websocket")
-        .header("Connection", "Upgrade")
-        .header("Sec-WebSocket-Version", 13)
-        .uri(connect_addr.as_str())
-        .body(())
-        .map_err(|err| WebsocketClientError::ConnectionError(err.to_string()))?;
-
-    for (key, value) in extra_headers.clone() {
-        debug!("Adding header: {}={}", key, value);
-
-        // https://stackoverflow.com/questions/23975391/how-to-convert-a-string-into-a-static-str
-        let key_static_ref: &'static str = key.leak();
-        let value_static_ref: &'static str = value.leak();
-        request.headers_mut().insert(
-            key_static_ref,
-            tungstenite::http::HeaderValue::from_static(value_static_ref),
-        );
-    }
-
-    let (ws_stream, _response) = tokio_tungstenite::connect_async(request)
-        .await
-        .map_err(|err| WebsocketClientError::ConnectionError(err.to_string()))?;
     info!("{} WebSocket handshake completed", connect_addr.as_str());
     send_event(WebsocketClientInboundEvent::Connected);
 
@@ -114,7 +94,7 @@ async fn start_client(
                             Ok(message) => {
                                 if message.is_text() {
                                     let data = message.into_text().expect("Message received from server is not valid string");
-                                    info!("Received message: {}", data);
+                                    //info!("Received message: {}", data);
                                     send_event(WebsocketClientInboundEvent::NewMessage(data));
                                 } else if message.is_binary() {
                                     send_event(WebsocketClientInboundEvent::Error(WebsocketClientError::ReceiveMessageError("Binary data is not supported".to_string())));
@@ -193,34 +173,44 @@ impl WebsocketClient {
             mpsc::unbounded_channel::<WebsocketClientCloseConnectionEvent>();
 
         let mut lua_handle = AsyncHandle::new(move || {
-            let event = inbound_event_receiver.blocking_recv().unwrap();
-            info!("Received event - \"{:?}\"", event);
-            let callbacks = callbacks.clone();
-            schedule(move |_| {
-                match event {
-                    WebsocketClientInboundEvent::Connected => {
-                        if let Some(on_connect) = callbacks.on_connect.clone() {
-                            on_connect.call::<_, ()>(id.to_string())?;
+            // Use try_recv to avoid blocking in the async context
+            if let Ok(event) = inbound_event_receiver.try_recv() {
+                info!("Received event - \"{:?}\"", event);
+                let callbacks = callbacks.clone();
+                schedule(move |_| {
+                    match event {
+                        WebsocketClientInboundEvent::Connected => {
+                            if let Some(on_connect) = callbacks.on_connect.clone() {
+                                if let Err(err) = on_connect.call::<_, ()>(id.to_string()) {
+                                    error!("Error calling on_connect callback: {}", err);
+                                }
+                            }
+                        }
+                        WebsocketClientInboundEvent::Disconnected => {
+                            if let Some(on_disconnect) = callbacks.on_disconnect {
+                                if let Err(err) = on_disconnect.call::<_, ()>(id.to_string()) {
+                                    error!("Error calling on_disconnect callback: {}", err);
+                                }
+                            }
+                        }
+                        WebsocketClientInboundEvent::NewMessage(message) => {
+                            if let Some(on_message) = callbacks.on_message.clone() {
+                                if let Err(err) = on_message.call::<_, ()>((id.to_string(), message)) {
+                                    error!("Error calling on_message callback: {}", err);
+                                }
+                            }
+                        }
+                        WebsocketClientInboundEvent::Error(error) => {
+                            if let Some(on_error) = callbacks.on_error.clone() {
+                                if let Err(err) = on_error.call::<_, ()>((id.to_string(), error)) {
+                                    error!("Error calling on_error callback: {}", err);
+                                }
+                            }
                         }
                     }
-                    WebsocketClientInboundEvent::Disconnected => {
-                        if let Some(on_disconnect) = callbacks.on_disconnect {
-                            on_disconnect.call::<_, ()>(id.to_string())?;
-                        }
-                    }
-                    WebsocketClientInboundEvent::NewMessage(message) => {
-                        if let Some(on_message) = callbacks.on_message.clone() {
-                            on_message.call::<_, ()>((id.to_string(), message))?;
-                        }
-                    }
-                    WebsocketClientInboundEvent::Error(error) => {
-                        if let Some(on_error) = callbacks.on_error.clone() {
-                            on_error.call::<_, ()>((id.to_string(), error))?;
-                        }
-                    }
-                }
-                Ok(())
-            });
+                    Ok(())
+                });
+            }
             Ok::<_, nvim_oxi::Error>(())
         })?;
 
@@ -244,9 +234,6 @@ impl WebsocketClient {
                 inbound_event_publisher_clone
                     .send(WebsocketClientInboundEvent::Error(err))
                     .unwrap_or_else(|err| error!("Failed to send event: {}", err));
-                lua_handle_clone
-                    .send()
-                    .unwrap_or_else(|err| error!("Failed to send event: {}", err));
             };
 
             WEBSOCKET_CLIENT_REGISTRY.lock().remove(&id);
@@ -268,9 +255,6 @@ impl WebsocketClient {
     fn send_event(&self, event: WebsocketClientInboundEvent) {
         self.inbound_event_publisher
             .send(event)
-            .unwrap_or_else(|err| error!("Failed to send event: {}", err));
-        self.lua_handle
-            .send()
             .unwrap_or_else(|err| error!("Failed to send event: {}", err));
     }
 
@@ -294,6 +278,11 @@ impl WebsocketClient {
                 ));
                 ()
             });
+    }
+
+    fn poll_events(&self) {
+        // Trigger the lua_handle to process any pending events
+        let _ = self.lua_handle.send();
     }
 }
 

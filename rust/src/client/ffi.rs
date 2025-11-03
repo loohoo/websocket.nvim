@@ -14,7 +14,8 @@ pub fn websocket_client_ffi() -> Dictionary {
         ),
         ("disconnect", Object::from(Function::from_fn(disconnect))),
         ("send_data", Object::from(Function::from_fn(send_data))),
-        ("get_clients", Object::from(Function::from_fn(get_clients)))
+        ("get_clients", Object::from(Function::from_fn(get_clients))),
+        ("poll_events", Object::from(Function::from_fn(poll_events))),
     ])
 }
 
@@ -31,8 +32,9 @@ fn disconnect(client_id: String) -> nvim_oxi::Result<()> {
     let client_id = Uuid::parse_str(&client_id).unwrap();
 
     let mut registry = WEBSOCKET_CLIENT_REGISTRY.lock();
-    let client = registry.get_mut(&client_id).unwrap();
-    client.disconnect();
+    if let Some(client) = registry.get_mut(&client_id) {
+        client.disconnect();
+    }
     Ok(())
 }
 
@@ -40,8 +42,9 @@ fn send_data((client_id, data): (String, String)) -> nvim_oxi::Result<()> {
     let client_id = Uuid::parse_str(&client_id).unwrap();
 
     let mut registry = WEBSOCKET_CLIENT_REGISTRY.lock();
-    let client = registry.get_mut(&client_id).unwrap();
-    client.send_data(data);
+    if let Some(client) = registry.get_mut(&client_id) {
+        client.send_data(data);
+    }
     Ok(())
 }
 
@@ -53,6 +56,14 @@ fn get_clients((): ()) -> nvim_oxi::Result<Dictionary> {
         .map(|(id, client)| (id.to_string().as_str().into(), client.into()))
         .collect();
     Ok(Dictionary::from_iter(clients))
+}
+
+fn poll_events((): ()) -> nvim_oxi::Result<()> {
+    let registry = WEBSOCKET_CLIENT_REGISTRY.lock();
+    for client in registry.get_all().iter() {
+        client.1.poll_events();
+    }
+    Ok(())
 }
 
 impl From<&WebsocketClient> for Dictionary {
